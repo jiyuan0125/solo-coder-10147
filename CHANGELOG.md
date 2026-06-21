@@ -1,3 +1,9 @@
+# Unreleased
+
+## Features
+
+* Add `CollectStructRows` for scanning rows directly into a slice of structs by column name
+
 # 5.10.0 (June 3, 2026)
 
 This release includes a significant amount of hardening against malicious or compromised PostgreSQL servers,

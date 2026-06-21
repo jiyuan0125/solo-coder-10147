@@ -869,3 +869,284 @@ func setupStructScanTargets(receiver any, fields []structRowField) []any {
 	}
 	return scanTargets
 }
+
+var structRowFieldCache sync.Map
+
+type structRowFieldCacheKey struct {
+	t        reflect.Type
+	colNames string
+}
+
+type structRowFieldCacheValue struct {
+	fields []structRowField
+	err    error
+}
+
+type structFieldInfo struct {
+	colName string
+	path    []int
+	hasTag  bool
+}
+
+// CollectStructRows scans all rows from rows into a slice of T. T must be a struct.
+//
+// Columns are matched to struct fields by name. The match is case-insensitive.
+// The "db" struct tag can override the column name. If the "db" tag value contains
+// a comma, only the part before the comma is used as the column name.
+// If the "db" struct tag is "-" then the field is ignored.
+//
+// When a field does not have a "db" tag, matching also ignores underscores so that
+// snake_case column names match camelCase field names.
+//
+// Unmatched columns in the result set are silently ignored.
+// Non-ignored struct fields that have no corresponding column in the result set
+// cause an error.
+//
+// Embedded struct fields are flattened as per Go's field shadowing rules: outer fields
+// take precedence over inner fields with the same name. Embedded non-struct types are
+// treated as regular fields with the type name as the field name. Embedded pointers
+// are not flattened.
+//
+// Self-referential embeds (directly or indirectly) are detected and do not cause
+// infinite recursion.
+//
+// NULL database values can be scanned into pointer types, database/sql Null types,
+// and pgtype nullable types. Scanning NULL into a non-pointer, non-nullable type
+// returns an error.
+//
+// If scanning fails partway through the result set, the successfully scanned rows
+// are returned along with the error. An empty result set returns an empty slice
+// (not nil).
+//
+// Rows is closed when CollectStructRows returns.
+//
+// CollectStructRows uses the underlying Rows.Scan plan cache, so scanning multiple
+// rows is efficient.
+func CollectStructRows[T any](rows Rows) ([]T, error) {
+	defer rows.Close()
+
+	slice := make([]T, 0)
+
+	var zero T
+	typ := reflect.TypeOf(zero)
+	if typ.Kind() != reflect.Struct {
+		return slice, fmt.Errorf("CollectStructRows: T must be a struct, got %s", typ.Kind())
+	}
+
+	fldDescs := rows.FieldDescriptions()
+
+	fields, err := lookupStructRowFields(typ, fldDescs)
+	if err != nil {
+		return slice, err
+	}
+
+	scanTargets := make([]any, len(fields))
+
+	for rows.Next() {
+		var value T
+		v := reflect.ValueOf(&value).Elem()
+		for i, f := range fields {
+			if f.path != nil {
+				scanTargets[i] = v.FieldByIndex(f.path).Addr().Interface()
+			} else {
+				scanTargets[i] = nil
+			}
+		}
+		if err := rows.Scan(scanTargets...); err != nil {
+			return slice, err
+		}
+		slice = append(slice, value)
+	}
+
+	if err := rows.Err(); err != nil {
+		return slice, err
+	}
+
+	return slice, nil
+}
+
+func lookupStructRowFields(t reflect.Type, fldDescs []pgconn.FieldDescription) ([]structRowField, error) {
+	key := structRowFieldCacheKey{
+		t:        t,
+		colNames: joinFieldNames(fldDescs),
+	}
+
+	if cached, ok := structRowFieldCache.Load(key); ok {
+		v := cached.(*structRowFieldCacheValue)
+		return v.fields, v.err
+	}
+
+	fields, err := computeStructRowFields(t, fldDescs)
+
+	cacheVal := &structRowFieldCacheValue{fields: fields, err: err}
+	structRowFieldCache.Store(key, cacheVal)
+
+	return fields, err
+}
+
+func computeStructRowFields(t reflect.Type, fldDescs []pgconn.FieldDescription) ([]structRowField, error) {
+	typeStack := make(map[reflect.Type]bool)
+	usedColNames := make(map[string]bool)
+
+	fieldInfos := collectStructFields(t, nil, typeStack, usedColNames)
+
+	fields := make([]structRowField, len(fldDescs))
+	matched := make(map[int]bool)
+
+	for i, info := range fieldInfos {
+		idx := findColumnIndex(fldDescs, info.colName, info.hasTag)
+		if idx >= 0 {
+			if fields[idx].path == nil {
+				fields[idx] = structRowField{path: info.path}
+				matched[i] = true
+			}
+		}
+	}
+
+	for i, info := range fieldInfos {
+		if !matched[i] {
+			return nil, fmt.Errorf(
+				"struct %s has no corresponding column for field %q",
+				t.Name(), info.colName,
+			)
+		}
+	}
+
+	return fields, nil
+}
+
+func collectStructFields(
+	t reflect.Type,
+	pathPrefix []int,
+	typeStack map[reflect.Type]bool,
+	usedColNames map[string]bool,
+) []structFieldInfo {
+	if typeStack[t] {
+		return nil
+	}
+	typeStack[t] = true
+	defer delete(typeStack, t)
+
+	var infos []structFieldInfo
+
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+
+		if sf.PkgPath != "" && !sf.Anonymous {
+			continue
+		}
+
+		if sf.Anonymous {
+			continue
+		}
+
+		colName, hasTag, skip := parseDbTag(sf)
+		if skip {
+			continue
+		}
+
+		lowerName := strings.ToLower(colName)
+		if usedColNames[lowerName] {
+			continue
+		}
+		usedColNames[lowerName] = true
+
+		path := append(append([]int(nil), pathPrefix...), i)
+		infos = append(infos, structFieldInfo{
+			colName: colName,
+			path:    path,
+			hasTag:  hasTag,
+		})
+	}
+
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+
+		if !sf.Anonymous {
+			continue
+		}
+
+		ft := sf.Type
+		isPtr := false
+		if ft.Kind() == reflect.Ptr {
+			isPtr = true
+			ft = ft.Elem()
+		}
+
+		if ft.Kind() != reflect.Struct {
+			typeName := ft.Name()
+			if typeName == "" {
+				continue
+			}
+			if typeName[0] < 'A' || typeName[0] > 'Z' {
+				continue
+			}
+
+			colName, hasTag, skip := parseDbTag(sf)
+			if skip {
+				continue
+			}
+			if !hasTag {
+				colName = typeName
+			}
+
+			lowerName := strings.ToLower(colName)
+			if usedColNames[lowerName] {
+				continue
+			}
+			usedColNames[lowerName] = true
+
+			path := append(append([]int(nil), pathPrefix...), i)
+			infos = append(infos, structFieldInfo{
+				colName: colName,
+				path:    path,
+				hasTag:  hasTag,
+			})
+			continue
+		}
+
+		if isPtr {
+			continue
+		}
+
+		path := append(append([]int(nil), pathPrefix...), i)
+		embeddedInfos := collectStructFields(ft, path, typeStack, usedColNames)
+		infos = append(infos, embeddedInfos...)
+	}
+
+	return infos
+}
+
+func parseDbTag(sf reflect.StructField) (colName string, hasTag bool, skip bool) {
+	tag, ok := sf.Tag.Lookup(structTagKey)
+	if !ok {
+		return sf.Name, false, false
+	}
+
+	colName, _, _ = strings.Cut(tag, ",")
+
+	if colName == "-" {
+		return "", true, true
+	}
+
+	return colName, true, false
+}
+
+func findColumnIndex(fldDescs []pgconn.FieldDescription, colName string, hasTag bool) int {
+	if hasTag {
+		lowerName := strings.ToLower(colName)
+		for i, fd := range fldDescs {
+			if strings.ToLower(fd.Name) == lowerName {
+				return i
+			}
+		}
+	} else {
+		normalized := strings.ToLower(strings.ReplaceAll(colName, "_", ""))
+		for i, fd := range fldDescs {
+			if strings.ToLower(strings.ReplaceAll(fd.Name, "_", "")) == normalized {
+				return i
+			}
+		}
+	}
+	return -1
+}
