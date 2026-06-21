@@ -883,9 +883,10 @@ type structRowFieldCacheValue struct {
 }
 
 type structFieldInfo struct {
-	colName string
-	path    []int
-	hasTag  bool
+	colName  string
+	path     []int
+	hasTag   bool
+	optional bool
 }
 
 // CollectStructRows scans all rows from rows into a slice of T. T must be a struct.
@@ -900,15 +901,19 @@ type structFieldInfo struct {
 //
 // Unmatched columns in the result set are silently ignored.
 // Non-ignored struct fields that have no corresponding column in the result set
-// cause an error.
+// cause an error — unless the result set is empty (zero rows), in which case an
+// empty slice is returned regardless of column/field matching.
 //
 // Embedded struct fields are flattened as per Go's field shadowing rules: outer fields
-// take precedence over inner fields with the same name. Embedded non-struct types are
-// treated as regular fields with the type name as the field name. Embedded pointers
-// are not flattened.
+// take precedence over inner fields with the same name. Embedded non-struct named types
+// are treated as regular fields with the type name as the field name (normalized the
+// same way as untagged fields).
 //
-// Self-referential embeds (directly or indirectly) are detected and do not cause
-// infinite recursion.
+// Embedded pointers to structs have their direct (non-embedded) fields flattened one
+// level deep; nil pointers are allocated automatically during scanning. Inner embedded
+// fields within the pointed-to struct are not recursively flattened. Self-referential
+// pointer chains (e.g. type Node struct { Next *Node }) are detected and skipped to
+// avoid infinite recursion.
 //
 // NULL database values can be scanned into pointer types, database/sql Null types,
 // and pgtype nullable types. Scanning NULL into a non-pointer, non-nullable type
@@ -922,6 +927,15 @@ type structFieldInfo struct {
 //
 // CollectStructRows uses the underlying Rows.Scan plan cache, so scanning multiple
 // rows is efficient.
+//
+// Custom PostgreSQL types (e.g. types created with CREATE TYPE AS) must be
+// registered on the connection's type map before use:
+//
+//	conn.TypeMap().RegisterType(&pgtype.Type{
+//		Name:  "address",
+//		OID:   addressOID,
+//		Codec: &pgtype.CompositeCodec{...},
+//	})
 func CollectStructRows[T any](rows Rows) ([]T, error) {
 	defer rows.Close()
 
@@ -933,6 +947,13 @@ func CollectStructRows[T any](rows Rows) ([]T, error) {
 		return slice, fmt.Errorf("CollectStructRows: T must be a struct, got %s", typ.Kind())
 	}
 
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return slice, err
+		}
+		return slice, nil
+	}
+
 	fldDescs := rows.FieldDescriptions()
 
 	fields, err := lookupStructRowFields(typ, fldDescs)
@@ -942,12 +963,14 @@ func CollectStructRows[T any](rows Rows) ([]T, error) {
 
 	scanTargets := make([]any, len(fields))
 
-	for rows.Next() {
+	first := true
+	for first || rows.Next() {
+		first = false
 		var value T
 		v := reflect.ValueOf(&value).Elem()
 		for i, f := range fields {
 			if f.path != nil {
-				scanTargets[i] = v.FieldByIndex(f.path).Addr().Interface()
+				scanTargets[i] = fieldByIndexAllocatingPointers(v, f.path).Addr().Interface()
 			} else {
 				scanTargets[i] = nil
 			}
@@ -963,6 +986,19 @@ func CollectStructRows[T any](rows Rows) ([]T, error) {
 	}
 
 	return slice, nil
+}
+
+func fieldByIndexAllocatingPointers(v reflect.Value, index []int) reflect.Value {
+	for _, x := range index {
+		if v.Kind() == reflect.Ptr {
+			if v.IsNil() {
+				v.Set(reflect.New(v.Type().Elem()))
+			}
+			v = v.Elem()
+		}
+		v = v.Field(x)
+	}
+	return v
 }
 
 func lookupStructRowFields(t reflect.Type, fldDescs []pgconn.FieldDescription) ([]structRowField, error) {
@@ -988,7 +1024,7 @@ func computeStructRowFields(t reflect.Type, fldDescs []pgconn.FieldDescription) 
 	typeStack := make(map[reflect.Type]bool)
 	usedColNames := make(map[string]bool)
 
-	fieldInfos := collectStructFields(t, nil, typeStack, usedColNames)
+	fieldInfos := collectStructFields(t, nil, typeStack, usedColNames, false)
 
 	fields := make([]structRowField, len(fldDescs))
 	matched := make(map[int]bool)
@@ -1004,7 +1040,7 @@ func computeStructRowFields(t reflect.Type, fldDescs []pgconn.FieldDescription) 
 	}
 
 	for i, info := range fieldInfos {
-		if !matched[i] {
+		if !matched[i] && !info.optional {
 			return nil, fmt.Errorf(
 				"struct %s has no corresponding column for field %q",
 				t.Name(), info.colName,
@@ -1020,6 +1056,7 @@ func collectStructFields(
 	pathPrefix []int,
 	typeStack map[reflect.Type]bool,
 	usedColNames map[string]bool,
+	fromEmbeddedPtr bool,
 ) []structFieldInfo {
 	if typeStack[t] {
 		return nil
@@ -1045,17 +1082,18 @@ func collectStructFields(
 			continue
 		}
 
-		lowerName := strings.ToLower(colName)
-		if usedColNames[lowerName] {
+		normKey := normalizeColName(colName, hasTag)
+		if usedColNames[normKey] {
 			continue
 		}
-		usedColNames[lowerName] = true
+		usedColNames[normKey] = true
 
 		path := append(append([]int(nil), pathPrefix...), i)
 		infos = append(infos, structFieldInfo{
-			colName: colName,
-			path:    path,
-			hasTag:  hasTag,
+			colName:  colName,
+			path:     path,
+			hasTag:   hasTag,
+			optional: fromEmbeddedPtr,
 		})
 	}
 
@@ -1090,31 +1128,90 @@ func collectStructFields(
 				colName = typeName
 			}
 
-			lowerName := strings.ToLower(colName)
-			if usedColNames[lowerName] {
+			normKey := normalizeColName(colName, hasTag)
+			if usedColNames[normKey] {
 				continue
 			}
-			usedColNames[lowerName] = true
+			usedColNames[normKey] = true
 
 			path := append(append([]int(nil), pathPrefix...), i)
 			infos = append(infos, structFieldInfo{
-				colName: colName,
-				path:    path,
-				hasTag:  hasTag,
+				colName:  colName,
+				path:     path,
+				hasTag:   hasTag,
+				optional: fromEmbeddedPtr,
 			})
 			continue
 		}
 
 		if isPtr {
+			if typeStack[ft] {
+				continue
+			}
+			path := append(append([]int(nil), pathPrefix...), i)
+			directInfos := collectDirectFieldsFromEmbeddedPtr(ft, path, usedColNames)
+			infos = append(infos, directInfos...)
+			continue
+		}
+
+		if fromEmbeddedPtr {
 			continue
 		}
 
 		path := append(append([]int(nil), pathPrefix...), i)
-		embeddedInfos := collectStructFields(ft, path, typeStack, usedColNames)
+		embeddedInfos := collectStructFields(ft, path, typeStack, usedColNames, false)
 		infos = append(infos, embeddedInfos...)
 	}
 
 	return infos
+}
+
+func collectDirectFieldsFromEmbeddedPtr(
+	t reflect.Type,
+	pathPrefix []int,
+	usedColNames map[string]bool,
+) []structFieldInfo {
+	var infos []structFieldInfo
+
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+
+		if sf.PkgPath != "" && !sf.Anonymous {
+			continue
+		}
+
+		if sf.Anonymous {
+			continue
+		}
+
+		colName, hasTag, skip := parseDbTag(sf)
+		if skip {
+			continue
+		}
+
+		normKey := normalizeColName(colName, hasTag)
+		if usedColNames[normKey] {
+			continue
+		}
+		usedColNames[normKey] = true
+
+		path := append(append([]int(nil), pathPrefix...), i)
+		infos = append(infos, structFieldInfo{
+			colName:  colName,
+			path:     path,
+			hasTag:   hasTag,
+			optional: true,
+		})
+	}
+
+	return infos
+}
+
+func normalizeColName(colName string, hasTag bool) string {
+	if hasTag {
+		return strings.ToLower(colName)
+	}
+	return strings.ToLower(strings.ReplaceAll(colName, "_", ""))
 }
 
 func parseDbTag(sf reflect.StructField) (colName string, hasTag bool, skip bool) {
