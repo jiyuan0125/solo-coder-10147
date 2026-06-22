@@ -970,7 +970,14 @@ func CollectStructRows[T any](rows Rows) ([]T, error) {
 		v := reflect.ValueOf(&value).Elem()
 		for i, f := range fields {
 			if f.path != nil {
-				scanTargets[i] = fieldByIndexAllocatingPointers(v, f.path).Addr().Interface()
+				fv, err := fieldByIndexAllocatingPointers(v, f.path)
+				if err != nil {
+					return slice, fmt.Errorf(
+						"struct %s: %w (field path %v)",
+						typ.Name(), err, f.path,
+					)
+				}
+				scanTargets[i] = fv.Addr().Interface()
 			} else {
 				scanTargets[i] = nil
 			}
@@ -988,17 +995,29 @@ func CollectStructRows[T any](rows Rows) ([]T, error) {
 	return slice, nil
 }
 
-func fieldByIndexAllocatingPointers(v reflect.Value, index []int) reflect.Value {
-	for _, x := range index {
+func fieldByIndexAllocatingPointers(v reflect.Value, index []int) (reflect.Value, error) {
+	for i, x := range index {
 		if v.Kind() == reflect.Ptr {
 			if v.IsNil() {
+				if !v.CanSet() {
+					return reflect.Value{}, fmt.Errorf(
+						"cannot allocate nil pointer at path index %d: field is unexported",
+						i,
+					)
+				}
 				v.Set(reflect.New(v.Type().Elem()))
 			}
 			v = v.Elem()
 		}
 		v = v.Field(x)
+		if !v.CanSet() {
+			return reflect.Value{}, fmt.Errorf(
+				"cannot scan into field at path index %d: field is unexported",
+				i,
+			)
+		}
 	}
-	return v
+	return v, nil
 }
 
 func lookupStructRowFields(t reflect.Type, fldDescs []pgconn.FieldDescription) ([]structRowField, error) {
@@ -1048,6 +1067,21 @@ func computeStructRowFields(t reflect.Type, fldDescs []pgconn.FieldDescription) 
 		}
 	}
 
+	var zero reflect.Value
+	for _, f := range fields {
+		if f.path != nil {
+			if !zero.IsValid() {
+				zero = reflect.New(t).Elem()
+			}
+			if _, err := fieldByIndexAllocatingPointers(zero, f.path); err != nil {
+				return nil, fmt.Errorf(
+					"struct %s: cannot scan into embedded unexported type at field path %v: %w",
+					t.Name(), f.path, err,
+				)
+			}
+		}
+	}
+
 	return fields, nil
 }
 
@@ -1089,11 +1123,12 @@ func collectStructFields(
 		usedColNames[normKey] = true
 
 		path := append(append([]int(nil), pathPrefix...), i)
+		isSelfRefPtr := sf.Type.Kind() == reflect.Ptr && sf.Type.Elem() == t
 		infos = append(infos, structFieldInfo{
 			colName:  colName,
 			path:     path,
 			hasTag:   hasTag,
-			optional: fromEmbeddedPtr,
+			optional: fromEmbeddedPtr || isSelfRefPtr,
 		})
 	}
 
@@ -1114,9 +1149,6 @@ func collectStructFields(
 		if ft.Kind() != reflect.Struct {
 			typeName := ft.Name()
 			if typeName == "" {
-				continue
-			}
-			if typeName[0] < 'A' || typeName[0] > 'Z' {
 				continue
 			}
 

@@ -1235,18 +1235,18 @@ func TestCollectStructRows_ScanErrorMidway_RowsClosed(t *testing.T) {
 	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
 		_, err := conn.Exec(ctx, `
 create temporary table t_midway_bad (n int, val text);
-insert into t_midway_bad(n, val) values (1, 'ok');
-insert into t_midway_bad(n, val) values (2, 'badval_not_int');
-insert into t_midway_bad(n, val) values (3, 'ok');
+insert into t_midway_bad(n, val) values (1, '1');
+insert into t_midway_bad(n, val) values (2, 'not_an_integer');
+insert into t_midway_bad(n, val) values (3, '3');
 `)
 		require.NoError(t, err)
 
-		rows, err := conn.Query(ctx, `select n, case when n = 2 then val::int else n end as x from t_midway_bad order by n`)
+		rows, err := conn.Query(ctx, `select n, val from t_midway_bad order by n`)
 		require.NoError(t, err)
 
 		type badTarget struct {
 			N int32 `db:"n"`
-			X int32 `db:"x"`
+			X int32 `db:"val"`
 		}
 		got, scanErr := pgx.CollectStructRows[badTarget](rows)
 		require.Error(t, scanErr)
@@ -1283,40 +1283,57 @@ func TestCollectStructRows_ConcurrentRace(t *testing.T) {
 			Tags []string  `db:"tags"`
 		}
 
+		connStr := os.Getenv("PGX_TEST_DATABASE")
+		require.NotEmpty(t, connStr, "PGX_TEST_DATABASE must be set for concurrent test")
+
 		_, err := conn.Exec(ctx, `
-create temporary table if not exists t_race_a (id int, name text);
-insert into t_race_a (id, name) values (1, 'a1'), (2, 'a2');
+drop table if exists t_race_a_perm;
+drop table if exists t_race_b_perm;
+drop table if exists t_race_c_perm;
+drop table if exists t_race_d_perm;
 
-create temporary table if not exists t_race_b (blob bytea, msg text);
-insert into t_race_b (blob, msg) values (E'\\x000102', 'hello');
+create table t_race_a_perm (id int, name text);
+insert into t_race_a_perm (id, name) values (1, 'a1'), (2, 'a2');
 
-create temporary table if not exists t_race_c (score int, x int, y int);
-insert into t_race_c (score, x, y) values (95, 1, 2);
+create table t_race_b_perm (blob bytea, msg text);
+insert into t_race_b_perm (blob, msg) values (E'\\x000102', 'hello');
 
-create temporary table if not exists t_race_d (when_ timestamptz, tags text[]);
-insert into t_race_d (when_, tags) values ('2025-01-02T03:04:05+00', array['x','y']);
+create table t_race_c_perm (score int, x int, y int);
+insert into t_race_c_perm (score, x, y) values (95, 1, 2);
+
+create table t_race_d_perm (when_ timestamptz, tags text[]);
+insert into t_race_d_perm (when_, tags) values ('2025-01-02T03:04:05+00', array['x','y']);
 `)
 		require.NoError(t, err)
+		defer func() {
+			_, _ = conn.Exec(ctx, `
+drop table if exists t_race_a_perm;
+drop table if exists t_race_b_perm;
+drop table if exists t_race_c_perm;
+drop table if exists t_race_d_perm;
+`)
+		}()
 
 		type querySpec struct {
 			name string
 			sql  string
 		}
 		queries := []querySpec{
-			{"A1", "select id, name from t_race_a"},
-			{"A2", "select name, id from t_race_a"},
-			{"B1", "select blob, msg from t_race_b"},
-			{"C1", "select score, x, y from t_race_c"},
-			{"D1", "select when_, tags from t_race_d"},
-			{"A3", "select id, name from t_race_a"},
-			{"B2", "select msg, blob from t_race_b"},
-			{"C2", "select y, score, x from t_race_c"},
+			{"A1", "select id, name from t_race_a_perm"},
+			{"A2", "select name, id from t_race_a_perm"},
+			{"B1", "select blob, msg from t_race_b_perm"},
+			{"C1", "select score, x, y from t_race_c_perm"},
+			{"D1", "select when_, tags from t_race_d_perm"},
+			{"A3", "select id, name from t_race_a_perm"},
+			{"B2", "select msg, blob from t_race_b_perm"},
+			{"C2", "select y, score, x from t_race_c_perm"},
 		}
 
 		pgx.StructRowFieldCacheClear()
 
 		var wg sync.WaitGroup
 		var errorCount atomic.Int64
+		var typeCounters [4]atomic.Int64
 
 		const rounds = 20
 		for r := 0; r < rounds; r++ {
@@ -1324,10 +1341,19 @@ insert into t_race_d (when_, tags) values ('2025-01-02T03:04:05+00', array['x','
 				wg.Add(1)
 				go func(goroutineID int, query querySpec) {
 					defer wg.Done()
+
+					gConn, gErr := pgx.Connect(ctx, connStr)
+					if gErr != nil {
+						errorCount.Add(1)
+						t.Errorf("goroutine %d: connect err: %v", goroutineID, gErr)
+						return
+					}
+					defer gConn.Close(ctx)
+
 					for iter := 0; iter < 5; iter++ {
 						switch goroutineID % 4 {
 						case 0, 1:
-							rows, qErr := conn.Query(ctx, query.sql)
+							rows, qErr := gConn.Query(ctx, query.sql)
 							if qErr != nil {
 								errorCount.Add(1)
 								t.Errorf("query err: %v", qErr)
@@ -1339,6 +1365,7 @@ insert into t_race_d (when_, tags) values ('2025-01-02T03:04:05+00', array['x','
 								t.Errorf("A err[%s]: %v", query.name, aErr)
 								return
 							}
+							typeCounters[0].Add(int64(len(as)))
 							for _, a := range as {
 								if a.ID != 1 && a.ID != 2 {
 									errorCount.Add(1)
@@ -1346,7 +1373,7 @@ insert into t_race_d (when_, tags) values ('2025-01-02T03:04:05+00', array['x','
 								}
 							}
 						case 2:
-							rows, qErr := conn.Query(ctx, query.sql)
+							rows, qErr := gConn.Query(ctx, query.sql)
 							if qErr != nil {
 								errorCount.Add(1)
 								t.Errorf("query err: %v", qErr)
@@ -1358,9 +1385,10 @@ insert into t_race_d (when_, tags) values ('2025-01-02T03:04:05+00', array['x','
 								t.Errorf("B err[%s]: %v", query.name, bErr)
 								return
 							}
+							typeCounters[1].Add(int64(len(bs)))
 							_ = bs
 						case 3:
-							rows, qErr := conn.Query(ctx, query.sql)
+							rows, qErr := gConn.Query(ctx, query.sql)
 							if qErr != nil {
 								errorCount.Add(1)
 								t.Errorf("query err: %v", qErr)
@@ -1372,6 +1400,7 @@ insert into t_race_d (when_, tags) values ('2025-01-02T03:04:05+00', array['x','
 								t.Errorf("C err[%s]: %v", query.name, cErr)
 								return
 							}
+							typeCounters[2].Add(int64(len(cs)))
 							for _, c := range cs {
 								if c.Score == nil || *c.Score != 95 {
 									errorCount.Add(1)
@@ -1382,7 +1411,7 @@ insert into t_race_d (when_, tags) values ('2025-01-02T03:04:05+00', array['x','
 						switch goroutineID % 2 {
 						case 0:
 							if goroutineID%4 != 3 {
-								rows, qErr := conn.Query(ctx, queries[4].sql)
+								rows, qErr := gConn.Query(ctx, queries[4].sql)
 								if qErr != nil {
 									errorCount.Add(1)
 									t.Errorf("query err: %v", qErr)
@@ -1394,6 +1423,7 @@ insert into t_race_d (when_, tags) values ('2025-01-02T03:04:05+00', array['x','
 									t.Errorf("D err[%s]: %v", query.name, dErr)
 									return
 								}
+								typeCounters[3].Add(int64(len(ds)))
 								_ = ds
 							}
 						}
@@ -1404,6 +1434,15 @@ insert into t_race_d (when_, tags) values ('2025-01-02T03:04:05+00', array['x','
 		wg.Wait()
 
 		assert.Equal(t, int64(0), errorCount.Load())
+
+		aCount := typeCounters[0].Load()
+		bCount := typeCounters[1].Load()
+		cCount := typeCounters[2].Load()
+		dCount := typeCounters[3].Load()
+		assert.Greater(t, aCount, int64(0))
+		assert.Greater(t, bCount, int64(0))
+		assert.Greater(t, cCount, int64(0))
+		assert.Greater(t, dCount, int64(0))
 
 		cacheLen := pgx.StructRowFieldCacheLen()
 		expectedMin := 10
