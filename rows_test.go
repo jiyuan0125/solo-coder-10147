@@ -997,22 +997,22 @@ insert into products (name, price) values
 	// Soft Drink: $3
 }
 
-type testID int64
-type testTimestamp int64
+type TestID int64
+type TestTimestamp int64
 
-type testEmbedBase struct {
+type TestEmbedBase struct {
 	X int32 `db:"x"`
 	Y int32 `db:"y"`
 }
 
-type testOuterEmbedPtrBase struct {
+type TestOuterEmbedPtrBase struct {
 	X int32 `db:"x"`
 	Z int32 `db:"z"`
 }
 
-type testNode struct {
+type TestNode struct {
 	Val  int32 `db:"val"`
-	Next *testNode
+	Next *TestNode
 }
 
 func TestCollectStructRows_CaseInsensitive(t *testing.T) {
@@ -1089,7 +1089,7 @@ func TestCollectStructRows_EmbedStruct(t *testing.T) {
 
 	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
 		type outer struct {
-			testEmbedBase
+			TestEmbedBase
 			Y int32 `db:"y_alias"`
 		}
 
@@ -1100,7 +1100,7 @@ func TestCollectStructRows_EmbedStruct(t *testing.T) {
 		for _, r := range got {
 			assert.Equal(t, int32(1), r.X)
 			assert.Equal(t, int32(2), r.Y)
-			assert.Equal(t, int32(0), r.testEmbedBase.Y)
+			assert.Equal(t, int32(0), r.TestEmbedBase.Y)
 		}
 	})
 }
@@ -1113,7 +1113,7 @@ func TestCollectStructRows_EmbedPtrToStruct(t *testing.T) {
 
 	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
 		type outer struct {
-			*testOuterEmbedPtrBase
+			*TestOuterEmbedPtrBase
 			Y int32 `db:"y"`
 		}
 
@@ -1122,7 +1122,7 @@ func TestCollectStructRows_EmbedPtrToStruct(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, got, 2)
 		for _, r := range got {
-			require.NotNil(t, r.testOuterEmbedPtrBase)
+			require.NotNil(t, r.TestOuterEmbedPtrBase)
 			assert.Equal(t, int32(10), r.X)
 			assert.Equal(t, int32(20), r.Z)
 			assert.Equal(t, int32(30), r.Y)
@@ -1138,7 +1138,7 @@ func TestCollectStructRows_EmbedPtrToStruct_SelfRefSkip(t *testing.T) {
 
 	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
 		rows, _ := conn.Query(ctx, `select 7 as val from generate_series(1,3)`)
-		got, err := pgx.CollectStructRows[testNode](rows)
+		got, err := pgx.CollectStructRows[TestNode](rows)
 		require.NoError(t, err)
 		require.Len(t, got, 3)
 		for _, r := range got {
@@ -1156,8 +1156,8 @@ func TestCollectStructRows_EmbedNamedType(t *testing.T) {
 
 	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
 		type row struct {
-			testID
-			testTimestamp
+			TestID
+			TestTimestamp
 			Name string `db:"name"`
 		}
 
@@ -1165,8 +1165,8 @@ func TestCollectStructRows_EmbedNamedType(t *testing.T) {
 		got, err := pgx.CollectStructRows[row](rows)
 		require.NoError(t, err)
 		require.Len(t, got, 1)
-		assert.Equal(t, testID(99), got[0].testID)
-		assert.Equal(t, testTimestamp(1000), got[0].testTimestamp)
+		assert.Equal(t, TestID(99), got[0].TestID)
+		assert.Equal(t, TestTimestamp(1000), got[0].TestTimestamp)
 		assert.Equal(t, "n", got[0].Name)
 	})
 }
@@ -1276,7 +1276,7 @@ func TestCollectStructRows_ConcurrentRace(t *testing.T) {
 		}
 		type typeC struct {
 			Score *int32 `db:"score"`
-			testEmbedBase
+			TestEmbedBase
 		}
 		type typeD struct {
 			When time.Time `db:"when_"`

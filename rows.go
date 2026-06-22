@@ -958,7 +958,7 @@ func CollectStructRows[T any](rows Rows) ([]T, error) {
 
 	fields, err := lookupStructRowFields(typ, fldDescs)
 	if err != nil {
-		return slice, err
+		return nil, err
 	}
 
 	scanTargets := make([]any, len(fields))
@@ -1001,7 +1001,7 @@ func fieldByIndexAllocatingPointers(v reflect.Value, index []int) (reflect.Value
 			if v.IsNil() {
 				if !v.CanSet() {
 					return reflect.Value{}, fmt.Errorf(
-						"cannot allocate nil pointer at path index %d: field is unexported",
+						"cannot allocate nil pointer at path index %d: embedded field is unexported across package boundary",
 						i,
 					)
 				}
@@ -1010,7 +1010,8 @@ func fieldByIndexAllocatingPointers(v reflect.Value, index []int) (reflect.Value
 			v = v.Elem()
 		}
 		v = v.Field(x)
-		if !v.CanSet() {
+		isLeaf := i == len(index)-1
+		if isLeaf && !v.CanSet() {
 			return reflect.Value{}, fmt.Errorf(
 				"cannot scan into field at path index %d: field is unexported",
 				i,
@@ -1042,8 +1043,9 @@ func lookupStructRowFields(t reflect.Type, fldDescs []pgconn.FieldDescription) (
 func computeStructRowFields(t reflect.Type, fldDescs []pgconn.FieldDescription) ([]structRowField, error) {
 	typeStack := make(map[reflect.Type]bool)
 	usedColNames := make(map[string]bool)
+	usedFieldNames := make(map[string]bool)
 
-	fieldInfos := collectStructFields(t, nil, typeStack, usedColNames, false)
+	fieldInfos := collectStructFields(t, nil, typeStack, usedColNames, usedFieldNames, false)
 
 	fields := make([]structRowField, len(fldDescs))
 	matched := make(map[int]bool)
@@ -1090,6 +1092,7 @@ func collectStructFields(
 	pathPrefix []int,
 	typeStack map[reflect.Type]bool,
 	usedColNames map[string]bool,
+	usedFieldNames map[string]bool,
 	fromEmbeddedPtr bool,
 ) []structFieldInfo {
 	if typeStack[t] {
@@ -1116,10 +1119,16 @@ func collectStructFields(
 			continue
 		}
 
+		fieldKey := strings.ToLower(sf.Name)
+		if usedFieldNames[fieldKey] {
+			continue
+		}
+
 		normKey := normalizeColName(colName, hasTag)
 		if usedColNames[normKey] {
 			continue
 		}
+		usedFieldNames[fieldKey] = true
 		usedColNames[normKey] = true
 
 		path := append(append([]int(nil), pathPrefix...), i)
@@ -1160,10 +1169,16 @@ func collectStructFields(
 				colName = typeName
 			}
 
+			fieldKey := strings.ToLower(sf.Name)
+			if usedFieldNames[fieldKey] {
+				continue
+			}
+
 			normKey := normalizeColName(colName, hasTag)
 			if usedColNames[normKey] {
 				continue
 			}
+			usedFieldNames[fieldKey] = true
 			usedColNames[normKey] = true
 
 			path := append(append([]int(nil), pathPrefix...), i)
@@ -1181,7 +1196,7 @@ func collectStructFields(
 				continue
 			}
 			path := append(append([]int(nil), pathPrefix...), i)
-			directInfos := collectDirectFieldsFromEmbeddedPtr(ft, path, usedColNames)
+			directInfos := collectDirectFieldsFromEmbeddedPtr(ft, path, usedColNames, usedFieldNames)
 			infos = append(infos, directInfos...)
 			continue
 		}
@@ -1191,7 +1206,7 @@ func collectStructFields(
 		}
 
 		path := append(append([]int(nil), pathPrefix...), i)
-		embeddedInfos := collectStructFields(ft, path, typeStack, usedColNames, false)
+		embeddedInfos := collectStructFields(ft, path, typeStack, usedColNames, usedFieldNames, false)
 		infos = append(infos, embeddedInfos...)
 	}
 
@@ -1202,6 +1217,7 @@ func collectDirectFieldsFromEmbeddedPtr(
 	t reflect.Type,
 	pathPrefix []int,
 	usedColNames map[string]bool,
+	usedFieldNames map[string]bool,
 ) []structFieldInfo {
 	var infos []structFieldInfo
 
@@ -1221,10 +1237,16 @@ func collectDirectFieldsFromEmbeddedPtr(
 			continue
 		}
 
+		fieldKey := strings.ToLower(sf.Name)
+		if usedFieldNames[fieldKey] {
+			continue
+		}
+
 		normKey := normalizeColName(colName, hasTag)
 		if usedColNames[normKey] {
 			continue
 		}
+		usedFieldNames[fieldKey] = true
 		usedColNames[normKey] = true
 
 		path := append(append([]int(nil), pathPrefix...), i)
