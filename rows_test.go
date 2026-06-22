@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxtest"
 )
 
@@ -992,4 +995,418 @@ insert into products (name, price) values
 	// Cheeseburger: $10
 	// Fries: $5
 	// Soft Drink: $3
+}
+
+type testID int64
+type testTimestamp int64
+
+type testEmbedBase struct {
+	X int32 `db:"x"`
+	Y int32 `db:"y"`
+}
+
+type testOuterEmbedPtrBase struct {
+	X int32 `db:"x"`
+	Z int32 `db:"z"`
+}
+
+type testNode struct {
+	Val  int32 `db:"val"`
+	Next *testNode
+}
+
+func TestCollectStructRows_CaseInsensitive(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		type row struct {
+			FirstName string `db:"first_name"`
+			LastName  string
+			AGE       int32
+		}
+
+		rows, _ := conn.Query(ctx, `select 'Ada' as FIRST_NAME, 'Lovelace' as LastName, 36 as age from generate_series(1,2)`)
+		got, err := pgx.CollectStructRows[row](rows)
+		require.NoError(t, err)
+		require.Len(t, got, 2)
+		for _, r := range got {
+			assert.Equal(t, "Ada", r.FirstName)
+			assert.Equal(t, "Lovelace", r.LastName)
+			assert.Equal(t, int32(36), r.AGE)
+		}
+	})
+}
+
+func TestCollectStructRows_DbTagCommaTruncation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		type row struct {
+			Name string `db:"the_name,omitempty"`
+			Num  int32  `db:"the_num,omitempty"`
+		}
+
+		rows, _ := conn.Query(ctx, `select 'hello' as the_name, 42 as the_num from generate_series(1,1)`)
+		got, err := pgx.CollectStructRows[row](rows)
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, "hello", got[0].Name)
+		assert.Equal(t, int32(42), got[0].Num)
+	})
+}
+
+func TestCollectStructRows_EmptyResultSet(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		type row struct {
+			Foo int32 `db:"no_such_column"`
+			Bar string
+		}
+
+		rows, _ := conn.Query(ctx, `select n from generate_series(1,0) n`)
+		got, err := pgx.CollectStructRows[row](rows)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, 0, len(got))
+	})
+}
+
+func TestCollectStructRows_EmbedStruct(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		type outer struct {
+			testEmbedBase
+			Y int32 `db:"y_alias"`
+		}
+
+		rows, _ := conn.Query(ctx, `select 1 as x, 2 as y_alias from generate_series(1,3)`)
+		got, err := pgx.CollectStructRows[outer](rows)
+		require.NoError(t, err)
+		require.Len(t, got, 3)
+		for _, r := range got {
+			assert.Equal(t, int32(1), r.X)
+			assert.Equal(t, int32(2), r.Y)
+			assert.Equal(t, int32(0), r.testEmbedBase.Y)
+		}
+	})
+}
+
+func TestCollectStructRows_EmbedPtrToStruct(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		type outer struct {
+			*testOuterEmbedPtrBase
+			Y int32 `db:"y"`
+		}
+
+		rows, _ := conn.Query(ctx, `select 10 as x, 20 as z, 30 as y from generate_series(1,2)`)
+		got, err := pgx.CollectStructRows[outer](rows)
+		require.NoError(t, err)
+		require.Len(t, got, 2)
+		for _, r := range got {
+			require.NotNil(t, r.testOuterEmbedPtrBase)
+			assert.Equal(t, int32(10), r.X)
+			assert.Equal(t, int32(20), r.Z)
+			assert.Equal(t, int32(30), r.Y)
+		}
+	})
+}
+
+func TestCollectStructRows_EmbedPtrToStruct_SelfRefSkip(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		rows, _ := conn.Query(ctx, `select 7 as val from generate_series(1,3)`)
+		got, err := pgx.CollectStructRows[testNode](rows)
+		require.NoError(t, err)
+		require.Len(t, got, 3)
+		for _, r := range got {
+			assert.Equal(t, int32(7), r.Val)
+			assert.Nil(t, r.Next)
+		}
+	})
+}
+
+func TestCollectStructRows_EmbedNamedType(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		type row struct {
+			testID
+			testTimestamp
+			Name string `db:"name"`
+		}
+
+		rows, _ := conn.Query(ctx, `select 99 as test_id, 1000 as test_timestamp, 'n' as name from generate_series(1,1)`)
+		got, err := pgx.CollectStructRows[row](rows)
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, testID(99), got[0].testID)
+		assert.Equal(t, testTimestamp(1000), got[0].testTimestamp)
+		assert.Equal(t, "n", got[0].Name)
+	})
+}
+
+func TestCollectStructRows_MissingStructField_ErrorHasLocation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		type row struct {
+			Name string `db:"name"`
+			Num  int32  `db:"num_that_does_not_exist_in_result"`
+		}
+
+		rows, _ := conn.Query(ctx, `select 'hi' as name from generate_series(1,2)`)
+		got, err := pgx.CollectStructRows[row](rows)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "row")
+		assert.Contains(t, err.Error(), "num_that_does_not_exist_in_result")
+		assert.Nil(t, got)
+	})
+}
+
+func TestCollectStructRows_ScanErrorMidway_PreservesRows(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		_, err := conn.Exec(ctx, `
+create temporary table t_midway_ok (n int, txt text);
+insert into t_midway_ok(n, txt) values (1, 'a');
+insert into t_midway_ok(n, txt) values (2, 'b');
+insert into t_midway_ok(n, txt) values (3, 'c');
+`)
+		require.NoError(t, err)
+
+		rows, err := conn.Query(ctx, `select n, case when n = 3 then 99::text else txt end as txt from t_midway_ok order by n`)
+		require.NoError(t, err)
+
+		type goodRow struct {
+			N   int32  `db:"n"`
+			Txt string `db:"txt"`
+		}
+		got, scanErr := pgx.CollectStructRows[goodRow](rows)
+		require.NoError(t, scanErr)
+		require.Len(t, got, 3)
+		assert.Equal(t, int32(1), got[0].N)
+		assert.Equal(t, "a", got[0].Txt)
+		assert.Equal(t, int32(2), got[1].N)
+		assert.Equal(t, "b", got[1].Txt)
+		assert.Equal(t, int32(3), got[2].N)
+		assert.Equal(t, "99", got[2].Txt)
+	})
+}
+
+func TestCollectStructRows_ScanErrorMidway_RowsClosed(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		_, err := conn.Exec(ctx, `
+create temporary table t_midway_bad (n int, val text);
+insert into t_midway_bad(n, val) values (1, 'ok');
+insert into t_midway_bad(n, val) values (2, 'badval_not_int');
+insert into t_midway_bad(n, val) values (3, 'ok');
+`)
+		require.NoError(t, err)
+
+		rows, err := conn.Query(ctx, `select n, case when n = 2 then val::int else n end as x from t_midway_bad order by n`)
+		require.NoError(t, err)
+
+		type badTarget struct {
+			N int32 `db:"n"`
+			X int32 `db:"x"`
+		}
+		got, scanErr := pgx.CollectStructRows[badTarget](rows)
+		require.Error(t, scanErr)
+		assert.Contains(t, scanErr.Error(), "can't scan")
+		require.Len(t, got, 1)
+		if len(got) >= 1 {
+			assert.Equal(t, int32(1), got[0].N)
+			assert.Equal(t, int32(1), got[0].X)
+		}
+	})
+}
+
+func TestCollectStructRows_ConcurrentRace(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	defaultConnTestRunner.RunTest(ctx, t, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		type typeA struct {
+			ID   int32  `db:"id"`
+			Name string `db:"name"`
+		}
+		type typeB struct {
+			Blob []byte      `db:"blob"`
+			Msg  pgtype.Text `db:"msg"`
+		}
+		type typeC struct {
+			Score *int32 `db:"score"`
+			testEmbedBase
+		}
+		type typeD struct {
+			When time.Time `db:"when_"`
+			Tags []string  `db:"tags"`
+		}
+
+		_, err := conn.Exec(ctx, `
+create temporary table if not exists t_race_a (id int, name text);
+insert into t_race_a (id, name) values (1, 'a1'), (2, 'a2');
+
+create temporary table if not exists t_race_b (blob bytea, msg text);
+insert into t_race_b (blob, msg) values (E'\\x000102', 'hello');
+
+create temporary table if not exists t_race_c (score int, x int, y int);
+insert into t_race_c (score, x, y) values (95, 1, 2);
+
+create temporary table if not exists t_race_d (when_ timestamptz, tags text[]);
+insert into t_race_d (when_, tags) values ('2025-01-02T03:04:05+00', array['x','y']);
+`)
+		require.NoError(t, err)
+
+		type querySpec struct {
+			name string
+			sql  string
+		}
+		queries := []querySpec{
+			{"A1", "select id, name from t_race_a"},
+			{"A2", "select name, id from t_race_a"},
+			{"B1", "select blob, msg from t_race_b"},
+			{"C1", "select score, x, y from t_race_c"},
+			{"D1", "select when_, tags from t_race_d"},
+			{"A3", "select id, name from t_race_a"},
+			{"B2", "select msg, blob from t_race_b"},
+			{"C2", "select y, score, x from t_race_c"},
+		}
+
+		pgx.StructRowFieldCacheClear()
+
+		var wg sync.WaitGroup
+		var errorCount atomic.Int64
+
+		const rounds = 20
+		for r := 0; r < rounds; r++ {
+			for gi, q := range queries {
+				wg.Add(1)
+				go func(goroutineID int, query querySpec) {
+					defer wg.Done()
+					for iter := 0; iter < 5; iter++ {
+						switch goroutineID % 4 {
+						case 0, 1:
+							rows, qErr := conn.Query(ctx, query.sql)
+							if qErr != nil {
+								errorCount.Add(1)
+								t.Errorf("query err: %v", qErr)
+								return
+							}
+							as, aErr := pgx.CollectStructRows[typeA](rows)
+							if aErr != nil {
+								errorCount.Add(1)
+								t.Errorf("A err[%s]: %v", query.name, aErr)
+								return
+							}
+							for _, a := range as {
+								if a.ID != 1 && a.ID != 2 {
+									errorCount.Add(1)
+									t.Errorf("A[%s] bad id=%d", query.name, a.ID)
+								}
+							}
+						case 2:
+							rows, qErr := conn.Query(ctx, query.sql)
+							if qErr != nil {
+								errorCount.Add(1)
+								t.Errorf("query err: %v", qErr)
+								return
+							}
+							bs, bErr := pgx.CollectStructRows[typeB](rows)
+							if bErr != nil {
+								errorCount.Add(1)
+								t.Errorf("B err[%s]: %v", query.name, bErr)
+								return
+							}
+							_ = bs
+						case 3:
+							rows, qErr := conn.Query(ctx, query.sql)
+							if qErr != nil {
+								errorCount.Add(1)
+								t.Errorf("query err: %v", qErr)
+								return
+							}
+							cs, cErr := pgx.CollectStructRows[typeC](rows)
+							if cErr != nil {
+								errorCount.Add(1)
+								t.Errorf("C err[%s]: %v", query.name, cErr)
+								return
+							}
+							for _, c := range cs {
+								if c.Score == nil || *c.Score != 95 {
+									errorCount.Add(1)
+									t.Errorf("C[%s] bad score", query.name)
+								}
+							}
+						}
+						switch goroutineID % 2 {
+						case 0:
+							if goroutineID%4 != 3 {
+								rows, qErr := conn.Query(ctx, queries[4].sql)
+								if qErr != nil {
+									errorCount.Add(1)
+									t.Errorf("query err: %v", qErr)
+									return
+								}
+								ds, dErr := pgx.CollectStructRows[typeD](rows)
+								if dErr != nil {
+									errorCount.Add(1)
+									t.Errorf("D err[%s]: %v", query.name, dErr)
+									return
+								}
+								_ = ds
+							}
+						}
+					}
+				}(gi, q)
+			}
+		}
+		wg.Wait()
+
+		assert.Equal(t, int64(0), errorCount.Load())
+
+		cacheLen := pgx.StructRowFieldCacheLen()
+		expectedMin := 10
+		assert.GreaterOrEqual(t, cacheLen, expectedMin)
+	})
 }
