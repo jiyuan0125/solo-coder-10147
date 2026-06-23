@@ -1,9 +1,3 @@
-# 5.11.0 (Unreleased)
-
-## Features
-
-* Add `CollectRowsToStruct` and `AppendRowsToStruct` for directly scanning all rows into a slice of structs.
-
 # 5.10.0 (June 3, 2026)
 
 This release includes a significant amount of hardening against malicious or compromised PostgreSQL servers,
@@ -14,6 +8,7 @@ sent over TLS when the original connection used TLS.
 
 ## Features
 
+* Add `RowsToStructs` and `RowToStruct` for directly scanning query results into struct slices with strict NULL safety, case-insensitive column matching, and proper embedded struct handling
 * Add `require_auth` to restrict accepted server authentication methods (Sean Chittenden at CrowdStrike, Inc.)
 * Add `ParseConfigOptions.ConnStringAllowedKeys` to restrict allowed connection string keys (Sean Chittenden at CrowdStrike, Inc.)
 * Add `StructArgs` and `StrictStructArgs` for `@`-named queries (Tubelight30)
