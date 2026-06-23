@@ -869,3 +869,267 @@ func setupStructScanTargets(receiver any, fields []structRowField) []any {
 	}
 	return scanTargets
 }
+
+// CollectRowsToStruct iterates through rows and scans each row into a T, collecting the results into a slice of T.
+// T must be a struct. Rows columns are matched to struct fields by name (case-insensitive).
+// Struct fields with a "db" tag use the tag value as the column name. If the "db" tag is "-" the field is ignored.
+// NULL values from the database must be scanned into a pointer type, a sql.Null* type, or a pgtype nullable type.
+// If a non-nullable Go type receives a NULL value, an error is returned.
+// Unmatched columns in the result set are ignored without error.
+// Struct fields without a corresponding column in the result set return an error.
+// This function closes the rows automatically on return.
+// If an error occurs mid-scan, the slice will contain all rows successfully scanned before the error.
+func CollectRowsToStruct[T any](rows Rows) ([]T, error) {
+	return AppendRowsToStruct([]T{}, rows)
+}
+
+// AppendRowsToStruct iterates through rows, scanning each row into a T and appending it to slice.
+// See CollectRowsToStruct for details.
+func AppendRowsToStruct[T any, S ~[]T](slice S, rows Rows) (S, error) {
+	defer rows.Close()
+
+	var zero T
+	typ := reflect.TypeOf(zero)
+	if typ.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("T must be a struct, got %s", typ.Kind())
+	}
+
+	fldDescs := rows.FieldDescriptions()
+
+	structFields, err := lookupCollectRowsToStructFields(typ, fldDescs)
+	if err != nil {
+		return nil, err
+	}
+
+	scanner := &collectRowsToStructRowScanner[T]{
+		fields: structFields,
+	}
+
+	for rows.Next() {
+		scanner.value = *new(T)
+		err = rows.Scan(scanner)
+		if err != nil {
+			return slice, err
+		}
+		slice = append(slice, scanner.value)
+	}
+
+	if err := rows.Err(); err != nil {
+		return slice, err
+	}
+
+	return slice, nil
+}
+
+type collectRowsToStructRowScanner[T any] struct {
+	value  T
+	fields *collectRowsToStructFields
+}
+
+func (rs *collectRowsToStructRowScanner[T]) ScanRow(rows Rows) error {
+	rawValues := rows.RawValues()
+	for i, f := range rs.fields.fields {
+		if f.path == nil {
+			continue
+		}
+		if rawValues[i] == nil && !isNullableType(f.fieldType) {
+			return fmt.Errorf("cannot scan NULL into non-nullable type %s for column %q", f.fieldType, f.colName)
+		}
+	}
+
+	scanTargets := setupCollectRowsToStructScanTargets(&rs.value, rs.fields)
+	return rows.Scan(scanTargets...)
+}
+
+type collectRowsToStructField struct {
+	path      []int
+	fieldType reflect.Type
+	colName   string
+}
+
+type collectRowsToStructFields struct {
+	fields []collectRowsToStructField
+}
+
+var collectRowsToStructFieldMap sync.Map
+
+type collectRowsToStructFieldsKey struct {
+	t        reflect.Type
+	colNames string
+}
+
+func lookupCollectRowsToStructFields(
+	t reflect.Type,
+	fldDescs []pgconn.FieldDescription,
+) (*collectRowsToStructFields, error) {
+	key := collectRowsToStructFieldsKey{
+		t:        t,
+		colNames: joinFieldNames(fldDescs),
+	}
+	if cached, ok := collectRowsToStructFieldMap.Load(key); ok {
+		return cached.(*collectRowsToStructFields), nil
+	}
+
+	fieldStack := make([]int, 0, 1)
+	visitedTypes := make(map[reflect.Type]struct{})
+	colToFieldMap := make(map[string]*collectRowsToStructField)
+	structFieldNames := make(map[string]string)
+
+	err := computeCollectRowsToStructFields(
+		t,
+		&fieldStack,
+		visitedTypes,
+		colToFieldMap,
+		structFieldNames,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	fields := make([]collectRowsToStructField, len(fldDescs))
+	for i, fd := range fldDescs {
+		colName := strings.ToLower(fd.Name)
+		if sf, ok := colToFieldMap[colName]; ok {
+			fields[i] = *sf
+		}
+	}
+
+	for structField, colName := range structFieldNames {
+		found := false
+		for _, fd := range fldDescs {
+			if strings.ToLower(fd.Name) == strings.ToLower(colName) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("struct field %q does not have corresponding column in result set", structField)
+		}
+	}
+
+	result := &collectRowsToStructFields{fields: fields}
+	collectRowsToStructFieldMap.Store(key, result)
+	return result, nil
+}
+
+func computeCollectRowsToStructFields(
+	t reflect.Type,
+	fieldStack *[]int,
+	visitedTypes map[reflect.Type]struct{},
+	colToFieldMap map[string]*collectRowsToStructField,
+	structFieldNames map[string]string,
+) error {
+	if _, ok := visitedTypes[t]; ok {
+		return nil
+	}
+	visitedTypes[t] = struct{}{}
+
+	tail := len(*fieldStack)
+	*fieldStack = append(*fieldStack, 0)
+
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		(*fieldStack)[tail] = i
+
+		if sf.PkgPath != "" && !sf.Anonymous {
+			continue
+		}
+
+		if sf.Anonymous {
+			ft := sf.Type
+			if ft.Kind() == reflect.Ptr {
+				continue
+			}
+			if ft.Kind() == reflect.Struct {
+				newVisited := make(map[reflect.Type]struct{}, len(visitedTypes))
+				for k, v := range visitedTypes {
+					newVisited[k] = v
+				}
+				err := computeCollectRowsToStructFields(
+					ft,
+					fieldStack,
+					newVisited,
+					colToFieldMap,
+					structFieldNames,
+				)
+				if err != nil {
+					return err
+				}
+				continue
+			}
+		}
+
+		dbTag, dbTagPresent := sf.Tag.Lookup(structTagKey)
+		if dbTagPresent {
+			dbTag, _, _ = strings.Cut(dbTag, ",")
+		}
+		if dbTag == "-" {
+			continue
+		}
+
+		colName := dbTag
+		if !dbTagPresent {
+			colName = sf.Name
+		}
+		colNameLower := strings.ToLower(colName)
+
+		fieldPath := append([]int(nil), *fieldStack...)
+		if _, exists := colToFieldMap[colNameLower]; !exists {
+			colToFieldMap[colNameLower] = &collectRowsToStructField{
+				path:      fieldPath,
+				fieldType: sf.Type,
+				colName:   colName,
+			}
+			if dbTagPresent {
+				structFieldNames[sf.Name] = dbTag
+			} else {
+				structFieldNames[sf.Name] = sf.Name
+			}
+		}
+	}
+
+	*fieldStack = (*fieldStack)[:tail]
+	return nil
+}
+
+func isNullableType(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Ptr, reflect.Interface:
+		return true
+	}
+
+	if t.PkgPath() == "database/sql" && strings.HasPrefix(t.Name(), "Null") {
+		return true
+	}
+
+	if t.PkgPath() == "github.com/jackc/pgx/v5/pgtype" {
+		switch t.Name() {
+		case "Bool", "QChar", "Name", "Int8", "Int2", "Int4", "Int8Multirange",
+			"Int4Multirange", "Int4Range", "Int8Range", "Text", "Varchar",
+			"BPChar", "Char", "Float4", "Float8", "Numeric", "Date", "Time",
+			"Timestamp", "Timestamptz", "Interval", "UUID", "JSON", "JSONB",
+			"Point", "Line", "Lseg", "Box", "Path", "Polygon", "Circle",
+			"TextMultirange", "TextRange", "NumMultirange", "NumRange",
+			"TsMultirange", "TsRange", "TstzMultirange", "TstzRange",
+			"DateMultirange", "DateRange", "Inet", "CIDR", "Macaddr",
+			"Hstore", "Record", "Void", "Unknown", "Bytea":
+			return true
+		}
+	}
+
+	return false
+}
+
+func setupCollectRowsToStructScanTargets(receiver any, fields *collectRowsToStructFields) []any {
+	scanTargets := make([]any, len(fields.fields))
+	v := reflect.ValueOf(receiver).Elem()
+	for i, f := range fields.fields {
+		if f.path == nil {
+			scanTargets[i] = nil
+			continue
+		}
+		fieldAddr := v.FieldByIndex(f.path).Addr().Interface()
+		scanTargets[i] = fieldAddr
+	}
+	return scanTargets
+}
